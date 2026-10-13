@@ -4,7 +4,7 @@
 
 ## 前置要求
 
-- **repotitan 的 dockerd 模块**：从 [magisk-docker](https://github.com/repotitan/magisk-docker) 获取
+- **mgksu 的 dockerd 模块**：从 [dockerd](https://github.com/mgksu/dockerd) 获取
 - **Docker data-root 镜像**：`/data/adb/docker-data.img`（ext4，**必须非稀疏格式**）
 - **KernelSU 或 Magisk**
 
@@ -78,7 +78,7 @@ chmod 711 /data/adb/docker/lib/docker
 
 ## 致谢
 
-- [repotitan/magisk-docker](https://github.com/repotitan/magisk-docker) - Docker for Android
+- [mgksu/dockerd](https://github.com/mgksu/dockerd) - Docker for Android
 
 ## License
 
