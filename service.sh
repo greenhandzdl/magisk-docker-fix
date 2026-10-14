@@ -1,11 +1,21 @@
 #!/system/bin/sh
 # docker-fix service 脚本
-# 开机后最终挂载尝试 + 启动 dockerd
-# 防双重挂载：用 /proc/mounts 检查，多层嵌套时强制重建单一挂载
+# 开机后挂载 data-root 镜像 + 启动 dockerd
+# 教训(2026-10-14)：
+#   1. ksud 会执行 service.d/post-fs-data.d 下所有文件(不筛 .bak)，旧遗留脚本
+#      曾与本脚本并发挂载造成嵌套两层，已移入 /data/adb/docker/legacy/
+#   2. toybox pkill 只接受一个 pattern，'pkill -9 dockerd containerd' 静默失败，
+#      必须按 pgrep 拿到的 PID 逐个 kill
+#   3. dockerd.inotify 监听 disable 文件增删会自动 start/stop dockerd，
+#      操作 disable 前必须先杀掉 inotifyd，否则会并发拉起第二个 dockerd
+#   4. 只有确认 dockerd/containerd 全部死亡后才能删 docker.sock/pidfile，
+#      否则活 daemon 的 sock 被删，CLI 永久断连
 export PATH=/system/bin:/system/xbin:/system_ext/bin:/data/adb/ksu/bin:$PATH
+export DOCKER_HOST=unix:///data/adb/docker/run/docker.sock
 
 IMG=/data/adb/docker-data.img
 ROOT=/data/adb/docker/lib/docker
+RUNDIR=/data/adb/docker/run
 MODULE=/data/adb/modules/dockerd
 LOG=/data/adb/modules/docker-fix/service.log
 
@@ -18,12 +28,30 @@ done
 sleep 20
 echo "boot_completed 就绪" >> $LOG
 
-# 挂载层数（Android 无可靠 mountpoint 命令，直接查 /proc/mounts）
 mount_layers() {
     grep -c " $ROOT " /proc/mounts 2>/dev/null
 }
 
-# 卸掉所有挂载层 + 清理所有关联旧 loop
+# 停 inotifyd + 按 PID 杀 dockerd/containerd，等待全部退出
+kill_docker_all() {
+    for p in $(pgrep -f dockerd.inotify); do
+        kill -9 "$p" 2>/dev/null
+    done
+    for p in $(pgrep -x dockerd) $(pgrep -x containerd); do
+        kill -9 "$p" 2>/dev/null
+    done
+    i=0
+    while [ $i -lt 10 ]; do
+        if [ -z "$(pgrep -x dockerd)" ] && [ -z "$(pgrep -x containerd)" ]; then
+            break
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    echo "dockerd/containerd 已停止 (等待 $i 轮)" >> $LOG
+}
+
+# 卸掉所有挂载层 + 清理所有关联旧 loop（仅在 dockerd 已死时调用）
 clean_all() {
     i=0
     while [ $i -lt 8 ]; do
@@ -36,12 +64,9 @@ clean_all() {
     done
 }
 
-# 单一干净挂载
 do_mount() {
     DEV=$(losetup -f 2>/dev/null)
-    if [ -z "$DEV" ]; then
-        return 1
-    fi
+    [ -z "$DEV" ] && return 1
     losetup $DEV $IMG 2>/dev/null || return 1
     sleep 1
     mount -t ext4 -o "noatime,nodiratime,context=\"u:object_r:adb_data_file:s0\"" $DEV $ROOT 2>/dev/null
@@ -52,15 +77,18 @@ do_mount() {
     return 0
 }
 
+# 清残留 sock/pid（进程已死才允许）
+rm_stale_files() {
+    rm -f $RUNDIR/docker.sock $RUNDIR/docker.pid $RUNDIR/dockerd.pid 2>/dev/null
+}
+
 LAYERS=$(mount_layers)
 [ -z "$LAYERS" ] && LAYERS=0
 echo "当前挂载层数: $LAYERS" >> $LOG
 
 if [ "$LAYERS" -gt 1 ]; then
-    # post-fs-data 与 service 竞态导致双重嵌套挂载，全部拆掉重建
     echo "检测到 $LAYERS 层嵌套挂载，清理重建..." >> $LOG
-    pkill -9 dockerd containerd 2>/dev/null
-    sleep 3
+    kill_docker_all
     clean_all
     LAYERS=0
 fi
@@ -84,32 +112,29 @@ if [ "$LAYERS" -eq 0 ]; then
     fi
 fi
 
-# 等待文件系统就绪
+# 文件系统就绪；确保只有一个 dockerd 实例：先停干净，再启动
 sleep 5
-echo "启动 dockerd..." >> $LOG
-
-# 启动 dockerd
+kill_docker_all
+rm_stale_files
 rm -f $MODULE/disable 2>/dev/null
-rm -f /data/adb/docker/run/docker.sock 2>/dev/null
+echo "启动 dockerd..." >> $LOG
 /data/adb/docker/scripts/start.sh >> $LOG 2>&1
 
-# 等待并检查
 sleep 30
 D=/data/adb/docker/bin/docker
 img_count=$($D images 2>/dev/null | tail -n +2 | wc -l)
-echo "30s 后镜像数: $img_count" >> $LOG
+echo "30s 后镜像数: $img_count, 挂载层数: $(mount_layers)" >> $LOG
 
 if [ "$img_count" -eq 0 ]; then
-    # 先确认不是又出现了嵌套挂载
+    echo "镜像数为 0，全流程重来一遍..." >> $LOG
+    kill_docker_all
+    # 层数异常则重建挂载
     LAYERS=$(mount_layers)
-    echo "镜像数为 0（当前挂载层数: $LAYERS），重启 dockerd..." >> $LOG
-    if [ "$LAYERS" -gt 1 ]; then
+    if [ "$LAYERS" -ne 1 ]; then
         clean_all
         do_mount
     fi
-    pkill -9 dockerd containerd 2>/dev/null
-    sleep 5
-    rm -f /data/adb/docker/run/docker.sock 2>/dev/null
+    rm_stale_files
     /data/adb/docker/scripts/start.sh >> $LOG 2>&1
     sleep 30
     img_count=$($D images 2>/dev/null | tail -n +2 | wc -l)

@@ -1,7 +1,7 @@
 #!/system/bin/sh
 # docker-fix post-fs-data 脚本
-# 开机时快速尝试挂载（此时 loop 节点可能没建完，只试 2 轮）
-# 注意：只有确认完全未挂载才动手，绝不叠加第二层挂载
+# 开机早期快速尝试挂载（loop 节点可能没建完，只试 2 轮）
+# 只在完全未挂载时动手；已有任何一层就交给 service.sh 处理
 export PATH=/system/bin:/system/xbin:/system_ext/bin:/data/adb/ksu/bin:$PATH
 
 IMG=/data/adb/docker-data.img
@@ -10,22 +10,23 @@ LOG=/data/adb/modules/docker-fix/post-fs-data.log
 
 echo "=== post-fs-data 开始 $(date) ===" > $LOG
 
-# 已有任何一层挂载就直接退出，把后续处理留给 service.sh
 if grep -q " $ROOT " /proc/mounts 2>/dev/null; then
     echo "已挂载（层数: $(grep -c " $ROOT " /proc/mounts)），跳过" >> $LOG
     exit 0
 fi
 
-# 检查镜像文件
 if [ ! -f "$IMG" ]; then
     echo "镜像文件不存在" >> $LOG
     exit 1
 fi
 
-# 快速尝试挂载（只试 2 轮）
+# 挂载前释放未挂载的残留旧 loop，避免叠加关联
+losetup -j $IMG 2>/dev/null | cut -d: -f1 | while read dev; do
+    losetup -d $dev 2>/dev/null
+done
+
 i=0
 while [ $i -lt 2 ]; do
-    # 每轮开头重新确认，防止竞态窗口内被别人抢先挂载
     if grep -q " $ROOT " /proc/mounts 2>/dev/null; then
         echo "等待期间已被挂载，退出" >> $LOG
         exit 0
@@ -43,4 +44,4 @@ while [ $i -lt 2 ]; do
     sleep 1
 done
 
-echo "快速尝试失败，等待 service.d 阶段" >> $LOG
+echo "快速尝试失败，等待 service 阶段" >> $LOG

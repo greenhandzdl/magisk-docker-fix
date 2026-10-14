@@ -1,22 +1,39 @@
 #!/system/bin/sh
-# docker-fix 模块 action 脚本
-# 在 KernelSU 模块管理界面点击"运行"按钮时执行
-# 具备自愈能力：检测嵌套多重挂载并重建为单一干净挂载
+# docker-fix 模块 action 脚本（点击"运行"按钮）
+# 自愈流程：精确停进程 -> 单层挂载 -> 干净启动 dockerd -> 验证
 export PATH=/system/bin:/system/xbin:/system_ext/bin:/data/adb/ksu/bin:$PATH
+export DOCKER_HOST=unix:///data/adb/docker/run/docker.sock
 
 IMG=/data/adb/docker-data.img
 ROOT=/data/adb/docker/lib/docker
+RUNDIR=/data/adb/docker/run
 MODULE=/data/adb/modules/dockerd
 LOG=/data/adb/modules/docker-fix/action.log
 
 echo "=== docker-fix action 开始 $(date) ===" > $LOG
 
-# 挂载层数（不用 mountpoint，Android 上不可靠）
 mount_layers() {
     grep -c " $ROOT " /proc/mounts 2>/dev/null
 }
 
-# 卸掉所有挂载层 + 清理所有关联旧 loop
+# 停 inotifyd + 按 PID 杀 dockerd/containerd（toybox pkill 多 pattern 会静默失败）
+kill_docker_all() {
+    for p in $(pgrep -f dockerd.inotify); do
+        kill -9 "$p" 2>/dev/null
+    done
+    for p in $(pgrep -x dockerd) $(pgrep -x containerd); do
+        kill -9 "$p" 2>/dev/null
+    done
+    i=0
+    while [ $i -lt 10 ]; do
+        if [ -z "$(pgrep -x dockerd)" ] && [ -z "$(pgrep -x containerd)" ]; then
+            break
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+}
+
 clean_all() {
     i=0
     while [ $i -lt 8 ]; do
@@ -29,7 +46,6 @@ clean_all() {
     done
 }
 
-# 单一干净挂载
 do_mount() {
     DEV=$(losetup -f 2>/dev/null)
     if [ -z "$DEV" ]; then
@@ -44,8 +60,7 @@ do_mount() {
     sleep 1
     if ! mount -t ext4 -o "noatime,nodiratime,context=\"u:object_r:adb_data_file:s0\"" $DEV $ROOT 2>> $LOG; then
         echo "!!! 挂载失败 (I/O error)" | tee -a $LOG
-        echo "!!! 原因: F2FS + loop 驱动无法读取稀疏文件" | tee -a $LOG
-        echo "!!! 解决: cp 转换为非稀疏格式后重试" | tee -a $LOG
+        echo "!!! 若是稀疏文件所致: cp 转换为非稀疏格式后重试" | tee -a $LOG
         losetup -d $DEV 2>/dev/null
         return 1
     fi
@@ -59,15 +74,14 @@ if [ ! -f "$IMG" ]; then
 fi
 echo "✓ 镜像文件存在 ($(ls -lh $IMG | awk '{print $5}'))" | tee -a $LOG
 
-# 检查是否为稀疏文件
+# 稀疏文件检查
 actual=$(stat -c %b $IMG 2>/dev/null)
 blocksize=$(stat -c %B $IMG 2>/dev/null)
 apparent=$(stat -c %s $IMG 2>/dev/null)
 if [ -n "$actual" ] && [ -n "$blocksize" ] && [ -n "$apparent" ]; then
     real=$((actual * blocksize))
     if [ "$real" -lt "$apparent" ]; then
-        echo "⚠ 检测到稀疏文件 (实际: $((real/1073741824))G, 表观: $((apparent/1073741824))G)" | tee -a $LOG
-        echo "  稀疏文件可能导致 loop 挂载 I/O error，建议 cp 转换为非稀疏格式" | tee -a $LOG
+        echo "⚠ 稀疏文件 (实际: $((real/1073741824))G, 表观: $((apparent/1073741824))G)，可能引发 loop 挂载 I/O error" | tee -a $LOG
     fi
 fi
 
@@ -75,11 +89,10 @@ LAYERS=$(mount_layers)
 [ -z "$LAYERS" ] && LAYERS=0
 echo "当前挂载层数: $LAYERS" | tee -a $LOG
 
+D=/data/adb/docker/bin/docker
 if [ "$LAYERS" -gt 1 ]; then
-    # 嵌套双重挂载：dockerd 看到的是空数据视图，必须拆掉重建
-    echo "⚠ 检测到 $LAYERS 层嵌套挂载，重启 dockerd 并清理重建..." | tee -a $LOG
-    pkill -9 dockerd containerd 2>/dev/null
-    sleep 3
+    echo "⚠ 嵌套挂载 $LAYERS 层，停进程并清理重建..." | tee -a $LOG
+    kill_docker_all
     clean_all
     LAYERS=0
 fi
@@ -95,33 +108,26 @@ else
     echo "✓ 已挂载: $(grep " $ROOT " /proc/mounts | head -1)" | tee -a $LOG
 fi
 
-# 检查内容
-echo "  顶层内容: $(ls $ROOT | wc -l) 项" | tee -a $LOG
-echo "  VFS 层数: $(ls -1 $ROOT/vfs/dir 2>/dev/null | wc -l)" | tee -a $LOG
+echo "  顶层内容: $(ls $ROOT | wc -l) 项, VFS 层: $(ls -1 $ROOT/vfs/dir 2>/dev/null | wc -l)" | tee -a $LOG
 
-# 启动 dockerd
-echo "→ 启动 dockerd..." | tee -a $LOG
-rm -f $MODULE/disable 2>/dev/null
-
-D=/data/adb/docker/bin/docker
-if pgrep -x dockerd >/dev/null 2>&1; then
-    echo "✓ dockerd 已在运行 (PID $(pgrep -x dockerd))" | tee -a $LOG
-    img_count=$($D images 2>/dev/null | tail -n +2 | wc -l)
-    if [ "$img_count" -eq 0 ]; then
-        echo "  镜像数为 0，重启 dockerd..." | tee -a $LOG
-        pkill -9 dockerd containerd 2>/dev/null
-        sleep 3
-        rm -f /data/adb/docker/run/docker.sock 2>/dev/null
-        /data/adb/docker/scripts/start.sh >> $LOG 2>&1
-        sleep 8
-    fi
+# 干净启动：先停干净所有 docker 进程再拉起，避免双实例抢 sock/pidfile
+img_count=$($D images 2>/dev/null | tail -n +2 | wc -l)
+if [ "$img_count" -eq 0 ]; then
+    echo "→ 停净旧实例后启动 dockerd..." | tee -a $LOG
+    kill_docker_all
+    rm -f $RUNDIR/docker.sock $RUNDIR/docker.pid $RUNDIR/dockerd.pid 2>/dev/null
 else
-    rm -f /data/adb/docker/run/docker.sock 2>/dev/null
-    /data/adb/docker/scripts/start.sh >> $LOG 2>&1
-    sleep 8
+    echo "✓ dockerd 正常 (镜像数 $img_count)，无需重启" | tee -a $LOG
+    rm -f $MODULE/disable 2>/dev/null
+    echo "=== 完成 ===" | tee -a $LOG
+    echo "镜像数: $img_count" | tee -a $LOG
+    exit 0
 fi
 
-# 验证
+rm -f $MODULE/disable 2>/dev/null
+/data/adb/docker/scripts/start.sh >> $LOG 2>&1
+sleep 20
+
 IMG_COUNT=$($D images 2>/dev/null | tail -n +2 | wc -l)
 CTR_COUNT=$($D ps -a 2>/dev/null | tail -n +2 | wc -l)
 echo "=== 完成 ===" | tee -a $LOG
@@ -131,7 +137,7 @@ echo "容器数: $CTR_COUNT" | tee -a $LOG
 if [ "$IMG_COUNT" -gt 0 ]; then
     echo "✓ Docker 正常: $IMG_COUNT 镜像 / $CTR_COUNT 容器" | tee -a $LOG
 else
-    echo "⚠ Docker 运行但镜像数为 0" | tee -a $LOG
+    echo "⚠ Docker 运行但镜像数为 0，检查挂载层数: $(mount_layers)" | tee -a $LOG
 fi
 
 echo "=== docker-fix action 完成 ===" | tee -a $LOG
