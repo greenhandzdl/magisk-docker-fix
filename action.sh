@@ -47,6 +47,8 @@ clean_all() {
 }
 
 do_mount() {
+    # kernel 域无权读 adb_data_file，loop 预读 EIO -> ext4 读不到 superblock
+    chcon u:object_r:magisk_file:s0 $IMG 2>/dev/null
     DEV=$(losetup -f 2>/dev/null)
     if [ -z "$DEV" ]; then
         echo "!!! 无法找到空闲 loop 设备" | tee -a $LOG
@@ -58,9 +60,10 @@ do_mount() {
         return 1
     fi
     sleep 1
-    if ! mount -t ext4 -o "noatime,nodiratime,context=\"u:object_r:adb_data_file:s0\"" $DEV $ROOT 2>> $LOG; then
+    if ! mount -t ext4 -o "noatime,nodiratime" $DEV $ROOT 2>> $LOG; then
         echo "!!! 挂载失败 (I/O error)" | tee -a $LOG
-        echo "!!! 若是稀疏文件所致: cp 转换为非稀疏格式后重试" | tee -a $LOG
+        echo "!!! 先看 dmesg | grep 'avc.*kernel'：镜像标签被 restorecon 改回 adb_data_file 会 EIO" | tee -a $LOG
+        echo "!!! 其次才是稀疏文件: cp 转换为非稀疏格式后重试" | tee -a $LOG
         losetup -d $DEV 2>/dev/null
         return 1
     fi
@@ -73,6 +76,9 @@ if [ ! -f "$IMG" ]; then
     exit 1
 fi
 echo "✓ 镜像文件存在 ($(ls -lh $IMG | awk '{print $5}'))" | tee -a $LOG
+
+# SELinux 标签检查（kernel 域读 adb_data_file 会被拒，loop 读 EIO）
+echo "  镜像标签: $(ls -Z $IMG | awk '{print $1}')" | tee -a $LOG
 
 # 稀疏文件检查
 actual=$(stat -c %b $IMG 2>/dev/null)

@@ -10,6 +10,12 @@
 #      操作 disable 前必须先杀掉 inotifyd，否则会并发拉起第二个 dockerd
 #   4. 只有确认 dockerd/containerd 全部死亡后才能删 docker.sock/pidfile，
 #      否则活 daemon 的 sock 被删，CLI 永久断连
+# 教训(2026-10-30)：
+#   1. 镜像文件默认标签 adb_data_file 会被 kernel 域拒读(loop 的 kworker 读预取
+#      返回 EIO -> "unable to read superblock")，挂载必然失败；必须先把镜像标成
+#      magisk_file。restorecon/重装镜像都可能改回去，故每次挂载前都修一次
+#   2. mount -o context=... 在本 ROM 上返回 EACCES，改用普通挂载：镜像内部标签
+#      已由 restorecon 持久化进 ext4 xattr，不依赖挂载选项
 export PATH=/system/bin:/system/xbin:/system_ext/bin:/data/adb/ksu/bin:$PATH
 export DOCKER_HOST=unix:///data/adb/docker/run/docker.sock
 
@@ -64,16 +70,28 @@ clean_all() {
     done
 }
 
+# 镜像内部标签缺失时后台补（仅新格式化/新拷贝的镜像会走到）
+fix_inner_labels() {
+    case "$(ls -Zd $ROOT 2>/dev/null)" in
+        *unlabeled*)
+            echo "镜像内部标签缺失，后台 restorecon..." >> $LOG
+            (restorecon -R $ROOT >> $LOG 2>&1) &
+            ;;
+    esac
+}
+
 do_mount() {
+    # kernel 域无权读 adb_data_file，loop 预读会 EIO
+    chcon u:object_r:magisk_file:s0 $IMG 2>/dev/null
     DEV=$(losetup -f 2>/dev/null)
     [ -z "$DEV" ] && return 1
     losetup $DEV $IMG 2>/dev/null || return 1
     sleep 1
-    mount -t ext4 -o "noatime,nodiratime,context=\"u:object_r:adb_data_file:s0\"" $DEV $ROOT 2>/dev/null
-    if [ $? -ne 0 ]; then
+    if ! mount -t ext4 -o "noatime,nodiratime" $DEV $ROOT 2>>$LOG; then
         losetup -d $DEV 2>/dev/null
         return 1
     fi
+    fix_inner_labels
     return 0
 }
 

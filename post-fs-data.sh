@@ -2,6 +2,8 @@
 # docker-fix post-fs-data 脚本
 # 开机早期快速尝试挂载（loop 节点可能没建完，只试 2 轮）
 # 只在完全未挂载时动手；已有任何一层就交给 service.sh 处理
+# 注意：镜像必须先标成 magisk_file，否则 kernel 域读 adb_data_file 被拒，
+#       loop 预读 EIO -> ext4 读不到 superblock（2026-10-30 实测）
 export PATH=/system/bin:/system/xbin:/system_ext/bin:/data/adb/ksu/bin:$PATH
 
 IMG=/data/adb/docker-data.img
@@ -31,10 +33,11 @@ while [ $i -lt 2 ]; do
         echo "等待期间已被挂载，退出" >> $LOG
         exit 0
     fi
+    chcon u:object_r:magisk_file:s0 $IMG 2>/dev/null
     DEV=$(losetup -f 2>/dev/null)
     if [ -n "$DEV" ]; then
         losetup $DEV $IMG 2>/dev/null
-        if mount -t ext4 -o "noatime,nodiratime,context=\"u:object_r:adb_data_file:s0\"" $DEV $ROOT 2>/dev/null; then
+        if mount -t ext4 -o "noatime,nodiratime" $DEV $ROOT 2>>$LOG; then
             echo "挂载成功 (尝试 $i)" >> $LOG
             exit 0
         fi
